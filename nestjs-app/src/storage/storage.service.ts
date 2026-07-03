@@ -1,4 +1,5 @@
 import {
+  CreateBucketCommand,
   HeadBucketCommand,
   HeadObjectCommand,
   PutObjectCommand,
@@ -22,6 +23,8 @@ export interface UploadParams {
   body: Readable;
   contentLength?: number;
   contentType?: string;
+  /** Destination bucket; defaults to the configured bucket. */
+  bucket?: string;
 }
 
 /**
@@ -57,25 +60,27 @@ export class StorageService {
    */
   async uploadStream(params: UploadParams): Promise<UploadResult> {
     const size = params.contentLength ?? 0;
+    const bucket = params.bucket ?? this.bucket;
+    if (bucket !== this.bucket) await this.ensureBucket(bucket);
 
     if (size > 0 && size <= this.partSizeBytes) {
       const res = await this.s3.send(
         new PutObjectCommand({
-          Bucket: this.bucket,
+          Bucket: bucket,
           Key: params.key,
           Body: params.body,
           ContentLength: size,
           ContentType: params.contentType,
         }),
       );
-      this.logger.debug(`PutObject ${params.key} (${size} bytes)`);
-      return { bucket: this.bucket, key: params.key, etag: this.normalizeEtag(res.ETag) };
+      this.logger.debug(`PutObject ${bucket}/${params.key} (${size} bytes)`);
+      return { bucket, key: params.key, etag: this.normalizeEtag(res.ETag) };
     }
 
     const upload = new Upload({
       client: this.s3,
       params: {
-        Bucket: this.bucket,
+        Bucket: bucket,
         Key: params.key,
         Body: params.body,
         ContentType: params.contentType,
@@ -93,10 +98,24 @@ export class StorageService {
 
     const result = await upload.done();
     return {
-      bucket: this.bucket,
+      bucket,
       key: params.key,
       etag: 'ETag' in result ? this.normalizeEtag(result.ETag) : undefined,
     };
+  }
+
+  /** Create the bucket if it doesn't exist (supports routing to new buckets). */
+  private async ensureBucket(bucket: string): Promise<void> {
+    try {
+      await this.s3.send(new HeadBucketCommand({ Bucket: bucket }));
+    } catch (err) {
+      if (this.isNotFound(err)) {
+        await this.s3.send(new CreateBucketCommand({ Bucket: bucket }));
+        this.logger.log(`Created destination bucket "${bucket}"`);
+      } else {
+        throw err;
+      }
+    }
   }
 
   /** True when an object already exists — lets the worker skip redundant work. */
