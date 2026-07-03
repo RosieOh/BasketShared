@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { plainToInstance, Transform, Type } from 'class-transformer';
 import {
   IsBoolean,
@@ -53,10 +54,23 @@ export class EnvironmentVariables {
   @IsNotEmpty()
   WEBHOOK_SECRET!: string;
 
-  /** Shared secret for the management API (X-Admin-Token header). */
+  // ---- Auth (JWT + RBAC) ----
   @IsString()
   @IsNotEmpty()
-  ADMIN_API_KEY!: string;
+  JWT_SECRET!: string;
+
+  @IsString()
+  @IsNotEmpty()
+  JWT_EXPIRES_IN = '1h';
+
+  /** Bootstrap admin, seeded on first start if no users exist. */
+  @IsString()
+  @IsNotEmpty()
+  ADMIN_USERNAME = 'admin';
+
+  @IsString()
+  @IsNotEmpty()
+  ADMIN_PASSWORD!: string;
 
   @IsIn(LOG_LEVELS as unknown as string[])
   LOG_LEVEL: (typeof LOG_LEVELS)[number] = 'info';
@@ -80,6 +94,23 @@ export class EnvironmentVariables {
   @IsString()
   @IsNotEmpty()
   INGESTION_DATA_ROOT!: string;
+
+  // ---- Rate limiting & payload size ----
+  @Type(() => Number)
+  @IsInt()
+  @Min(1000)
+  THROTTLE_TTL_MS = 60000;
+
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  THROTTLE_LIMIT = 100;
+
+  /** Max JSON request body size in KB. */
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  MAX_PAYLOAD_SIZE_KB = 1024;
 
   /** Max number of file transfers processed concurrently by the worker. */
   @Type(() => Number)
@@ -110,6 +141,16 @@ export class EnvironmentVariables {
   @Max(65535)
   CLAMAV_PORT = 3310;
 
+  // ---- Failure alerting ----
+  @Transform(toBoolean)
+  @IsBoolean()
+  ALERTS_ENABLED = false;
+
+  /** Slack-compatible incoming-webhook URL for failure alerts. */
+  @IsString()
+  @IsOptional()
+  ALERT_WEBHOOK_URL?: string;
+
   // ---- Stuck-transfer recovery sweeper ----
   @Transform(toBoolean)
   @IsBoolean()
@@ -126,6 +167,12 @@ export class EnvironmentVariables {
   @Min(1)
   @Max(1000)
   RECOVERY_BATCH_SIZE = 50;
+
+  /** Delete terminal audit rows older than this many days. 0 disables. */
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  AUDIT_RETENTION_DAYS = 0;
 
   // ---- Redis (BullMQ) ----
   @IsString()
@@ -211,9 +258,33 @@ export class EnvironmentVariables {
 }
 
 /**
+ * Docker/Vault secrets convention: for any `X_FILE` env var pointing at a file,
+ * read its contents into `X` (unless `X` is already set). Runs before validation
+ * so both validation and the config factory see the resolved secret. This keeps
+ * plaintext secrets out of the environment/compose file.
+ */
+function resolveFileSecrets(): void {
+  for (const key of Object.keys(process.env)) {
+    if (!key.endsWith('_FILE')) continue;
+    const base = key.slice(0, -'_FILE'.length);
+    const path = process.env[key];
+    if (!path) continue;
+    try {
+      // _FILE is authoritative: it overrides any plaintext value for `base`.
+      process.env[base] = readFileSync(path, 'utf8').trim();
+    } catch {
+      // Unreadable: leave `base` as-is; validation surfaces a clear error.
+    }
+  }
+}
+
+/**
  * ConfigModule `validate` hook. Throws (aborting bootstrap) on any violation.
  */
 export function validateEnv(config: Record<string, unknown>): EnvironmentVariables {
+  resolveFileSecrets();
+  config = { ...process.env, ...config };
+
   const validated = plainToInstance(EnvironmentVariables, config, {
     enableImplicitConversion: false,
   });
