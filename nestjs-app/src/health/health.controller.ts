@@ -6,10 +6,12 @@ import {
   TypeOrmHealthIndicator,
 } from '@nestjs/terminus';
 import { ApiTags } from '@nestjs/swagger';
+import { SkipThrottle } from '@nestjs/throttler';
 import { RedisHealthIndicator } from './redis.health-indicator';
 import { S3HealthIndicator } from './s3.health-indicator';
 
 @ApiTags('health')
+@SkipThrottle()
 @Controller('health')
 export class HealthController {
   constructor(
