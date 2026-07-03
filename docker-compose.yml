@@ -1,0 +1,280 @@
+# =============================================================================
+# S3-SyncBridge — local, fully self-contained pipeline.
+#
+#   SFTP client --(2022)--> SFTPGo --on_upload webhook--> NestJS Orchestrator
+#                                \__ shared read-only volume __/        |
+#                                                                       v
+#                                                   PostgreSQL (audit)  MinIO (S3)
+#
+# All secrets come from `.env`. Start with:  docker compose up -d --build
+# =============================================================================
+
+name: s3-syncbridge
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — transfer audit / state store for the NestJS orchestrator.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      TZ: ${TZ}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [syncbridge-net]
+    # Bound to localhost only — not exposed on the LAN. Host port is decoupled
+    # from the internal 5432 so a local Postgres on the host doesn't collide.
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Redis — backing store for the BullMQ transfer queue.
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    networks: [syncbridge-net]
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ---------------------------------------------------------------------------
+  # MinIO — S3-compatible object storage (the transfer destination).
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    networks: [syncbridge-net]
+    ports:
+      - "${MINIO_API_PORT}:9000"      # S3 API
+      - "${MINIO_CONSOLE_PORT}:9001"  # Web console
+    healthcheck:
+      # Informational only — readiness is actually gated by `minio-init` below,
+      # which uses `mc` (always present) instead of relying on curl in the image.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # MinIO bootstrap — waits for MinIO, then creates the bucket idempotently.
+  # Exits 0 on success; dependents gate on `service_completed_successfully`.
+  # ---------------------------------------------------------------------------
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_started
+    networks: [syncbridge-net]
+    environment:
+      S3_BUCKET: ${S3_BUCKET}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: >
+      /bin/sh -c '
+      set -e;
+      echo "Waiting for MinIO to become ready...";
+      until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; do
+        sleep 2;
+      done;
+      echo "MinIO is up. Ensuring bucket $$S3_BUCKET exists...";
+      mc mb --ignore-existing "local/$$S3_BUCKET";
+      mc version enable "local/$$S3_BUCKET" || true;
+      echo "Bucket ready.";
+      '
+
+  # ---------------------------------------------------------------------------
+  # SFTPGo — SFTP ingestion entrypoint. Fires the on_upload HTTP hook.
+  # Stores uploaded files on a named volume shared (read-only) with NestJS.
+  # ---------------------------------------------------------------------------
+  sftpgo:
+    image: drakkan/sftpgo:v2.6-alpine
+    restart: unless-stopped
+    depends_on:
+      nestjs-app:
+        condition: service_started
+    environment:
+      TZ: ${TZ}
+      # Auto-provision the first admin so the setup screen is skipped.
+      # CREATE_DEFAULT_ADMIN must be enabled for the DEFAULT_ADMIN_* vars to apply.
+      SFTPGO_DATA_PROVIDER__CREATE_DEFAULT_ADMIN: "true"
+      SFTPGO_DEFAULT_ADMIN_USERNAME: ${SFTPGO_ADMIN_USER}
+      SFTPGO_DEFAULT_ADMIN_PASSWORD: ${SFTPGO_ADMIN_PASSWORD}
+      # Global filesystem action hook: POST JSON to NestJS on every upload.
+      # Token is passed as a query param because the legacy hook cannot set
+      # custom headers (the Event Manager UI flow in the guide uses a header).
+      SFTPGO_COMMON__ACTIONS__EXECUTE_ON: upload
+      SFTPGO_COMMON__ACTIONS__HOOK: "http://nestjs-app:${APP_PORT}/v1/sftp/on-upload?token=${WEBHOOK_SECRET}"
+      # Keep user home dirs under the shared data volume.
+      SFTPGO_USERS_BASE_DIR: /srv/sftpgo/data
+    volumes:
+      - sftpgo_data:/srv/sftpgo/data
+      - sftpgo_config:/var/lib/sftpgo
+    networks: [syncbridge-net]
+    ports:
+      - "${SFTPGO_SFTP_PORT}:2022"   # SFTP
+      - "${SFTPGO_HTTP_PORT}:8080"   # Web admin / REST API
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # NestJS Orchestrator — receives webhooks, streams files SFTPGo -> MinIO,
+  # audits everything in PostgreSQL. Reads the shared volume read-only.
+  # ---------------------------------------------------------------------------
+  nestjs-app:
+    build:
+      context: ./nestjs-app
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: ${NODE_ENV}
+      TZ: ${TZ}
+      APP_PORT: ${APP_PORT}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET}
+      ADMIN_API_KEY: ${ADMIN_API_KEY}
+      LOG_LEVEL: ${LOG_LEVEL}
+      LOG_PRETTY: ${LOG_PRETTY}
+      TRANSFER_MAX_ATTEMPTS: ${TRANSFER_MAX_ATTEMPTS}
+      TRANSFER_RETRY_BACKOFF_MS: ${TRANSFER_RETRY_BACKOFF_MS}
+      INGESTION_DATA_ROOT: ${INGESTION_DATA_ROOT}
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB}
+      AV_ENABLED: ${AV_ENABLED}
+      CLAMAV_HOST: ${CLAMAV_HOST}
+      CLAMAV_PORT: ${CLAMAV_PORT}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      DB_SYNCHRONIZE: ${DB_SYNCHRONIZE}
+      DB_LOGGING: ${DB_LOGGING}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      S3_ENDPOINT: ${S3_ENDPOINT}
+      S3_REGION: ${S3_REGION}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE}
+      S3_UPLOAD_PART_SIZE_MB: ${S3_UPLOAD_PART_SIZE_MB}
+      S3_UPLOAD_CONCURRENCY: ${S3_UPLOAD_CONCURRENCY}
+    volumes:
+      # Same mountpoint as SFTPGo so the absolute `path` in the webhook resolves
+      # identically. Read-only: the orchestrator never mutates the source tree.
+      - sftpgo_data:/srv/sftpgo/data:ro
+    networks: [syncbridge-net]
+    ports:
+      - "${APP_HOST_PORT}:3000"
+    healthcheck:
+      # 127.0.0.1 (not localhost) so busybox wget uses IPv4, matching the app's
+      # 0.0.0.0 bind — localhost can resolve to ::1 first and be refused.
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/health/live || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # ClamAV — antivirus scanning (opt-in). Enable with:
+  #   AV_ENABLED=true docker compose --profile av up -d
+  # The image is large and freshclam needs a few minutes on first start.
+  # ---------------------------------------------------------------------------
+  clamav:
+    image: clamav/clamav:1.4
+    restart: unless-stopped
+    profiles: ["av"]
+    volumes:
+      - clamav_data:/var/lib/clamav
+    networks: [syncbridge-net]
+    ports:
+      - "127.0.0.1:${CLAMAV_HOST_PORT:-13310}:3310"
+    healthcheck:
+      test: ["CMD-SHELL", "clamdscan --version || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # ---------------------------------------------------------------------------
+  # Prometheus + Grafana — metrics scraping & dashboards (opt-in). Enable with:
+  #   docker compose --profile monitoring up -d
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks: [syncbridge-net]
+    ports:
+      - "127.0.0.1:${PROMETHEUS_HOST_PORT:-9090}:9090"
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    depends_on: [prometheus]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    networks: [syncbridge-net]
+    ports:
+      - "${GRAFANA_HOST_PORT:-3001}:3000"
+
+networks:
+  syncbridge-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  minio_data:
+  redis_data:
+  sftpgo_data:
+  sftpgo_config:
+  clamav_data:
+  prometheus_data:
+  grafana_data:
