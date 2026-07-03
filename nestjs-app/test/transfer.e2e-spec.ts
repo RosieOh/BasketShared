@@ -30,7 +30,9 @@ describe('Transfer pipeline (e2e)', () => {
 
   const BUCKET = 'ingested-files';
   const WEBHOOK_SECRET = 'e2e-secret';
-  const ADMIN_KEY = 'e2e-admin';
+  const ADMIN_USER = 'admin';
+  const ADMIN_PASS = 'e2e-admin-pass';
+  let token: string;
 
   beforeAll(async () => {
     [pg, redis, minio] = await Promise.all([
@@ -64,7 +66,10 @@ describe('Transfer pipeline (e2e)', () => {
       NODE_ENV: 'test',
       APP_PORT: '3999', // unused (app.init() doesn't bind), but must pass validation
       WEBHOOK_SECRET,
-      ADMIN_API_KEY: ADMIN_KEY,
+      JWT_SECRET: 'e2e-jwt-secret',
+      JWT_EXPIRES_IN: '1h',
+      ADMIN_USERNAME: ADMIN_USER,
+      ADMIN_PASSWORD: ADMIN_PASS,
       LOG_LEVEL: 'error',
       LOG_PRETTY: 'false',
       INGESTION_DATA_ROOT: dataRoot,
@@ -103,6 +108,14 @@ describe('Transfer pipeline (e2e)', () => {
       new ValidationPipe({ whitelist: true, transform: true, transformOptions: { enableImplicitConversion: true } }),
     );
     await app.init();
+
+    // Log in as the seeded bootstrap admin to get a JWT for the management API.
+    const login = await request(app.getHttpServer())
+      .post('/v1/auth/login')
+      .send({ username: ADMIN_USER, password: ADMIN_PASS })
+      .expect(200);
+    token = login.body.access_token;
+    expect(token).toBeTruthy();
   });
 
   afterAll(async () => {
@@ -157,12 +170,16 @@ describe('Transfer pipeline (e2e)', () => {
       .expect(401);
   });
 
+  it('rejects the management API without a JWT (401)', async () => {
+    await request(app.getHttpServer()).get('/v1/transfers').expect(401);
+  });
+
   async function pollForSuccess(server: unknown, timeoutMs = 30_000): Promise<Record<string, unknown>> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const list = await request(server as never)
         .get('/v1/transfers?limit=1')
-        .set('X-Admin-Token', ADMIN_KEY)
+        .set('Authorization', `Bearer ${token}`)
         .expect(200);
       const item = list.body.items?.[0];
       if (item && (item.status === 'SUCCESS' || item.status === 'FAILED')) return item;
