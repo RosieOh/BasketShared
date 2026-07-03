@@ -3,13 +3,16 @@ import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import type { AppConfig } from '../config/configuration';
-import { TRANSFER_QUEUE } from './queue/transfer-queue';
+import { DEAD_LETTER_QUEUE, TRANSFER_QUEUE } from './queue/transfer-queue';
+import { DeadLetterProcessor } from './dead-letter.processor';
 import { FileTransfer } from './entities/file-transfer.entity';
 import { FileTransferRepository } from './file-transfer.repository';
 import { IngestionController } from './ingestion.controller';
 import { IngestionProcessor } from './ingestion.processor';
 import { IngestionService } from './ingestion.service';
 import { RecoveryService } from './recovery.service';
+import { RetentionService } from './retention.service';
+import { RoutingService } from './routing.service';
 import { TransfersController } from './transfers.controller';
 import { TransfersService } from './transfers.service';
 import { AntivirusStep } from './pipeline/antivirus.step';
@@ -36,13 +39,17 @@ import { ValidationStep } from './pipeline/validation.step';
         };
       },
     }),
+    BullModule.registerQueue({ name: DEAD_LETTER_QUEUE }),
   ],
   controllers: [IngestionController, TransfersController],
   providers: [
     IngestionService,
     IngestionProcessor,
+    DeadLetterProcessor,
     FileTransferRepository,
     RecoveryService,
+    RetentionService,
+    RoutingService,
     TransfersService,
     // Processing pipeline: steps + ordered assembly.
     ValidationStep,

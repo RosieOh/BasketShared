@@ -1,7 +1,8 @@
-import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
+import { InjectQueue, OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Job } from 'bullmq';
+import { context, propagation, SpanStatusCode, trace } from '@opentelemetry/api';
+import { Job, Queue } from 'bullmq';
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import type { AppConfig } from '../config/configuration';
@@ -11,11 +12,20 @@ import { TransferStatus } from './entities/file-transfer.entity';
 import { FileTransferRepository } from './file-transfer.repository';
 import { MetricsService } from '../metrics/metrics.service';
 import { ProcessingPipeline } from './pipeline/processing-pipeline';
+import { RoutingService } from './routing.service';
 import { StorageService } from '../storage/storage.service';
-import { TRANSFER_QUEUE, TransferJobData } from './queue/transfer-queue';
+import {
+  DEAD_LETTER_JOB,
+  DEAD_LETTER_QUEUE,
+  DeadLetterJobData,
+  TRANSFER_QUEUE,
+  TransferJobData,
+} from './queue/transfer-queue';
 
 /** Single-part S3 ETags are the hex MD5 of the body (no "-<parts>" suffix). */
 const SINGLE_PART_ETAG = /^[0-9a-f]{32}$/i;
+
+const tracer = trace.getTracer('s3-syncbridge');
 
 /**
  * BullMQ worker that performs the SFTPGo -> S3 transfer.
@@ -38,11 +48,17 @@ export class IngestionProcessor extends WorkerHost implements OnModuleInit {
     private readonly repository: FileTransferRepository,
     private readonly storage: StorageService,
     private readonly pipeline: ProcessingPipeline,
+    private readonly routing: RoutingService,
     private readonly metrics: MetricsService,
+    @InjectQueue(DEAD_LETTER_QUEUE) private readonly dlq: Queue<DeadLetterJobData>,
     private readonly config: ConfigService<AppConfig, true>,
   ) {
     super();
     this.concurrency = config.get('app.workerConcurrency', { infer: true });
+  }
+
+  private async toDeadLetter(transferId: string, reason: string): Promise<void> {
+    await this.dlq.add(DEAD_LETTER_JOB, { transferId, reason });
   }
 
   onModuleInit(): void {
@@ -50,7 +66,27 @@ export class IngestionProcessor extends WorkerHost implements OnModuleInit {
     this.worker.concurrency = this.concurrency;
   }
 
+  /** Span wrapper: links this job to the originating webhook trace. */
   async process(job: Job<TransferJobData>): Promise<void> {
+    const parentCtx = propagation.extract(context.active(), job.data.carrier ?? {});
+    return context.with(parentCtx, () =>
+      tracer.startActiveSpan('transfer.process', async (span) => {
+        span.setAttribute('transfer.id', job.data.transferId);
+        span.setAttribute('transfer.attempt', job.attemptsMade + 1);
+        try {
+          await this.runTransfer(job);
+        } catch (err) {
+          span.recordException(err as Error);
+          span.setStatus({ code: SpanStatusCode.ERROR });
+          throw err;
+        } finally {
+          span.end();
+        }
+      }),
+    );
+  }
+
+  private async runTransfer(job: Job<TransferJobData>): Promise<void> {
     const { transferId } = job.data;
     const transfer = await this.repository.findById(transferId);
     if (!transfer) {
@@ -82,15 +118,17 @@ export class IngestionProcessor extends WorkerHost implements OnModuleInit {
       await this.pipeline.run(ctx);
 
       const checksums = await computeFileChecksums(ctx.sourcePath);
+      const target = this.routing.resolve(transfer);
       const result = await this.storage.uploadStream({
-        key: this.buildObjectKey(transfer),
+        bucket: target.bucket,
+        key: target.key,
         body: createReadStream(ctx.sourcePath),
         contentLength: ctx.sizeBytes,
         contentType: ctx.metadata.contentType ?? 'application/octet-stream',
       });
       this.verifyIntegrity(result.etag, checksums.md5);
 
-      await this.repository.markSuccess(transfer.id, result.key, result.etag ?? null, checksums.sha256);
+      await this.repository.markSuccess(transfer.id, result.bucket, result.key, result.etag ?? null, checksums.sha256);
       this.metrics.recordSuccess(ctx.sizeBytes);
       this.logger.log(
         `Transfer ${transfer.id} SUCCESS (attempt ${job.attemptsMade + 1}) -> ` +
@@ -103,6 +141,7 @@ export class IngestionProcessor extends WorkerHost implements OnModuleInit {
         this.logger.error(`Transfer ${transfer.id} rejected: ${err.message}`);
         await this.repository.markFailed(transfer.id, err.message);
         this.metrics.recordFailure();
+        await this.toDeadLetter(transfer.id, err.message);
         return;
       }
       // Transient: let BullMQ retry. Finalization happens in onFailed.
@@ -125,6 +164,7 @@ export class IngestionProcessor extends WorkerHost implements OnModuleInit {
     this.logger.error(`Transfer ${job.data.transferId} FAILED. ${message}`);
     await this.repository.markFailed(job.data.transferId, message);
     this.metrics.recordFailure();
+    await this.toDeadLetter(job.data.transferId, message);
   }
 
   /**
@@ -136,11 +176,6 @@ export class IngestionProcessor extends WorkerHost implements OnModuleInit {
     if (etag && SINGLE_PART_ETAG.test(etag) && etag.toLowerCase() !== expectedMd5.toLowerCase()) {
       throw new Error(`Integrity check failed: ETag ${etag} != source MD5 ${expectedMd5}`);
     }
-  }
-
-  private buildObjectKey(transfer: { username: string; virtualPath: string }): string {
-    const relative = transfer.virtualPath.replace(/^\/+/, '');
-    return `${transfer.username}/${relative}`;
   }
 
   private errMessage(err: unknown): string {

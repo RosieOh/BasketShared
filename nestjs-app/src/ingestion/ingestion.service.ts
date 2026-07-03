@@ -1,6 +1,7 @@
 import { InjectQueue } from '@nestjs/bullmq';
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { context, propagation } from '@opentelemetry/api';
 import { Queue } from 'bullmq';
 import { createHash } from 'node:crypto';
 import { isAbsolute, relative, resolve } from 'node:path';
@@ -74,8 +75,11 @@ export class IngestionService {
     }
 
     this.logger.log(`Accepted upload ${payload.virtual_path} -> transfer ${record.id}`);
+    // Propagate the current trace context into the job so the worker span links.
+    const carrier: Record<string, string> = {};
+    propagation.inject(context.active(), carrier);
     // Enqueue for the worker; the controller returns without awaiting processing.
-    await this.queue.add(TRANSFER_JOB, { transferId: record.id });
+    await this.queue.add(TRANSFER_JOB, { transferId: record.id, carrier });
     return AcceptOutcome.ACCEPTED;
   }
 

@@ -50,7 +50,7 @@ describe('IngestionService', () => {
 
     expect(outcome).toBe(AcceptOutcome.ACCEPTED);
     expect(repository.createPendingIfAbsent).toHaveBeenCalledTimes(1);
-    expect(queue.add).toHaveBeenCalledWith(TRANSFER_JOB, { transferId: 'transfer-1' });
+    expect(queue.add).toHaveBeenCalledWith(TRANSFER_JOB, expect.objectContaining({ transferId: 'transfer-1' }));
   });
 
   it('treats a duplicate webhook (unique-key collision) as a no-op', async () => {
