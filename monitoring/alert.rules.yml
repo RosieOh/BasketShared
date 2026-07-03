@@ -1,0 +1,29 @@
+groups:
+  - name: syncbridge
+    rules:
+      - alert: TransfersFailing
+        expr: increase(syncbridge_transfers_total{status="FAILED"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "S3-SyncBridge transfers are failing"
+          description: "{{ $value }} transfer(s) failed in the last 5 minutes."
+
+      - alert: DeadLetterReceiving
+        expr: increase(syncbridge_dead_letter_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Transfers are landing in the dead-letter queue"
+          description: "{{ $value }} transfer(s) dead-lettered in the last 10 minutes."
+
+      - alert: TransferBacklog
+        expr: syncbridge_transfers_in_flight > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker backlog is high"
+          description: "{{ $value }} transfers in flight for over 5 minutes."
