@@ -95,6 +95,7 @@ services:
       S3_BUCKET: ${S3_BUCKET}
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      S3_LIFECYCLE_DAYS: ${S3_LIFECYCLE_DAYS}
     entrypoint: >
       /bin/sh -c '
       set -e;
@@ -105,6 +106,10 @@ services:
       echo "MinIO is up. Ensuring bucket $$S3_BUCKET exists...";
       mc mb --ignore-existing "local/$$S3_BUCKET";
       mc version enable "local/$$S3_BUCKET" || true;
+      if [ "$$S3_LIFECYCLE_DAYS" -gt 0 ] 2>/dev/null; then
+        echo "Applying lifecycle: expire objects after $$S3_LIFECYCLE_DAYS days";
+        mc ilm rule add --expire-days "$$S3_LIFECYCLE_DAYS" "local/$$S3_BUCKET" || true;
+      fi;
       echo "Bucket ready.";
       '
 
@@ -168,16 +173,33 @@ services:
       TZ: ${TZ}
       APP_PORT: ${APP_PORT}
       WEBHOOK_SECRET: ${WEBHOOK_SECRET}
-      ADMIN_API_KEY: ${ADMIN_API_KEY}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN}
+      ADMIN_USERNAME: ${ADMIN_USERNAME}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
       LOG_LEVEL: ${LOG_LEVEL}
       LOG_PRETTY: ${LOG_PRETTY}
       TRANSFER_MAX_ATTEMPTS: ${TRANSFER_MAX_ATTEMPTS}
       TRANSFER_RETRY_BACKOFF_MS: ${TRANSFER_RETRY_BACKOFF_MS}
       INGESTION_DATA_ROOT: ${INGESTION_DATA_ROOT}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY}
+      RECOVERY_ENABLED: ${RECOVERY_ENABLED}
+      RECOVERY_STALE_MS: ${RECOVERY_STALE_MS}
+      RECOVERY_BATCH_SIZE: ${RECOVERY_BATCH_SIZE}
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS}
+      THROTTLE_TTL_MS: ${THROTTLE_TTL_MS}
+      THROTTLE_LIMIT: ${THROTTLE_LIMIT}
+      MAX_PAYLOAD_SIZE_KB: ${MAX_PAYLOAD_SIZE_KB}
       MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB}
       AV_ENABLED: ${AV_ENABLED}
       CLAMAV_HOST: ${CLAMAV_HOST}
       CLAMAV_PORT: ${CLAMAV_PORT}
+      ALERTS_ENABLED: ${ALERTS_ENABLED}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL}
+      ROUTING_RULES: ${ROUTING_RULES}
+      OTEL_ENABLED: ${OTEL_ENABLED}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME}
       POSTGRES_HOST: ${POSTGRES_HOST}
       POSTGRES_PORT: ${POSTGRES_PORT}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -243,10 +265,32 @@ services:
     profiles: ["monitoring"]
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alert.rules.yml:/etc/prometheus/alert.rules.yml:ro
       - prometheus_data:/prometheus
     networks: [syncbridge-net]
     ports:
       - "127.0.0.1:${PROMETHEUS_HOST_PORT:-9090}:9090"
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    networks: [syncbridge-net]
+    ports:
+      - "127.0.0.1:${ALERTMANAGER_HOST_PORT:-9093}:9093"
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    networks: [syncbridge-net]
+    ports:
+      - "${JAEGER_UI_HOST_PORT:-16686}:16686"   # Jaeger UI
+      - "127.0.0.1:4318:4318"                    # OTLP HTTP receiver
 
   grafana:
     image: grafana/grafana:11.2.0

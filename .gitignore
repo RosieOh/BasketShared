@@ -17,6 +17,9 @@ nestjs-app/coverage/
 # Docker bind volumes (if any are mapped to ./data)
 /data/
 
+# Docker secrets (real secret material — never commit)
+/secrets/
+
 # Editor
 .idea/
 .vscode/
