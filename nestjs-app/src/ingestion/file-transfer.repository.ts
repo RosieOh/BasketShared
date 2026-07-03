@@ -61,12 +61,14 @@ export class FileTransferRepository {
 
   async markSuccess(
     id: string,
+    bucket: string,
     objectKey: string,
     etag: string | null,
     checksumSha256: string | null,
   ): Promise<void> {
     await this.repo.update(id, {
       status: TransferStatus.SUCCESS,
+      bucket,
       objectKey,
       etag,
       checksumSha256,
@@ -76,6 +78,22 @@ export class FileTransferRepository {
 
   async markFailed(id: string, errorLog: string): Promise<void> {
     await this.repo.update(id, { status: TransferStatus.FAILED, errorLog });
+  }
+
+  /** Find transfers eligible for a bulk retry (by status, optionally aged). */
+  findForRetryBatch(params: {
+    status: TransferStatus;
+    before?: Date;
+    limit: number;
+  }): Promise<FileTransfer[]> {
+    return this.repo.find({
+      where: {
+        status: params.status,
+        ...(params.before ? { updatedAt: LessThan(params.before) } : {}),
+      },
+      order: { createdAt: 'ASC' },
+      take: params.limit,
+    });
   }
 
   /** Reset a transfer so the worker will process it from scratch. */
@@ -99,6 +117,22 @@ export class FileTransferRepository {
       take: params.limit,
       skip: params.offset,
     });
+  }
+
+  /**
+   * Delete terminal (SUCCESS/FAILED) audit rows older than `cutoff`. Returns the
+   * number of rows removed. In-flight rows are never touched.
+   */
+  async deleteTerminalOlderThan(cutoff: Date): Promise<number> {
+    const result = await this.repo
+      .createQueryBuilder()
+      .delete()
+      .where('status IN (:...statuses)', {
+        statuses: [TransferStatus.SUCCESS, TransferStatus.FAILED],
+      })
+      .andWhere('updated_at < :cutoff', { cutoff })
+      .execute();
+    return result.affected ?? 0;
   }
 
   /**

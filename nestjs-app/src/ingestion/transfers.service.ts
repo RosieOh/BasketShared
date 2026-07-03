@@ -4,6 +4,7 @@ import { Queue } from 'bullmq';
 import { FileTransfer, TransferStatus } from './entities/file-transfer.entity';
 import { FileTransferRepository } from './file-transfer.repository';
 import { ListTransfersQueryDto } from './dto/list-transfers.query.dto';
+import { RetryBatchDto } from './dto/retry-batch.dto';
 import { TRANSFER_JOB, TRANSFER_QUEUE, TransferJobData } from './queue/transfer-queue';
 
 export interface PaginatedTransfers {
@@ -49,5 +50,24 @@ export class TransfersService {
     await this.queue.add(TRANSFER_JOB, { transferId: id });
     this.logger.log(`Transfer ${id} manually re-queued via management API`);
     return this.getById(id);
+  }
+
+  /** Bulk re-drive of transfers matching a status (default FAILED) and age. */
+  async retryBatch(dto: RetryBatchDto): Promise<{ requeued: number; ids: string[] }> {
+    const status = dto.status ?? TransferStatus.FAILED;
+    if (status === TransferStatus.SUCCESS) {
+      throw new ConflictException('Cannot batch-retry SUCCESS transfers');
+    }
+    const before = dto.before ? new Date(dto.before) : undefined;
+    const matches = await this.repository.findForRetryBatch({ status, before, limit: dto.limit });
+
+    const ids: string[] = [];
+    for (const transfer of matches) {
+      await this.repository.resetForRetry(transfer.id);
+      await this.queue.add(TRANSFER_JOB, { transferId: transfer.id });
+      ids.push(transfer.id);
+    }
+    this.logger.log(`Batch retry re-queued ${ids.length} transfer(s) [status=${status}]`);
+    return { requeued: ids.length, ids };
   }
 }
