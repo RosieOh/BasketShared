@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Build & test (Node 20)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: nestjs-app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: nestjs-app/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Unit tests
+        run: npm test
+
+      # Testcontainers uses the Docker daemon preinstalled on the runner.
+      - name: Integration / E2E tests
+        run: npm run test:e2e
+
+  docker:
+    name: Docker image & compose
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build orchestrator image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./nestjs-app
+          push: false
+          tags: s3-syncbridge-nestjs-app:ci
+          target: production
+
+      - name: Validate docker-compose (all profiles)
+        run: |
+          cp .env.example .env
+          docker compose --profile av --profile monitoring config --quiet
+          echo "compose config valid"
