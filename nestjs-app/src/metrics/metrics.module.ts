@@ -40,6 +40,10 @@ import { MetricsService } from './metrics.service';
       name: 'syncbridge_transfers_in_flight',
       help: 'Transfers accepted by the worker but not yet finalized',
     }),
+    makeCounterProvider({
+      name: 'syncbridge_dead_letter_total',
+      help: 'Transfers routed to the dead-letter queue',
+    }),
   ],
   exports: [MetricsService],
 })

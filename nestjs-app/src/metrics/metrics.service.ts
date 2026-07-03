@@ -15,6 +15,8 @@ export class MetricsService {
     private readonly duration: Histogram<string>,
     @InjectMetric('syncbridge_transfers_in_flight')
     private readonly inFlight: Gauge<string>,
+    @InjectMetric('syncbridge_dead_letter_total')
+    private readonly deadLetter: Counter<string>,
   ) {}
 
   /** Start a duration timer; call the returned fn once the transfer finalizes. */
@@ -37,5 +39,9 @@ export class MetricsService {
 
   recordFailure(): void {
     this.transfersTotal.inc({ status: TransferStatus.FAILED });
+  }
+
+  recordDeadLetter(): void {
+    this.deadLetter.inc();
   }
 }
