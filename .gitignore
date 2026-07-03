@@ -1,0 +1,24 @@
+# Secrets & local env
+.env
+*.env.local
+
+# Node
+node_modules/
+dist/
+coverage/
+*.log
+npm-debug.log*
+
+# NestJS 애플리케이션 의존성/빌드 산출물 (명시적 제외)
+nestjs-app/node_modules/
+nestjs-app/dist/
+nestjs-app/coverage/
+
+# Docker bind volumes (if any are mapped to ./data)
+/data/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
