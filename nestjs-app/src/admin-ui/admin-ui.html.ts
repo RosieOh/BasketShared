@@ -95,10 +95,18 @@ export const ADMIN_UI_HTML = /* html */ `<!doctype html>
           <td>\${t.attempts}</td>
           <td class="wrap">\${t.bucket}/\${t.objectKey ?? ''}</td>
           <td>\${new Date(t.updatedAt).toLocaleString()}</td>
-          <td>\${t.status === 'FAILED' && canRetry() ? \`<button onclick="retryOne('\${t.id}')">Retry</button>\` : ''}</td>
+          <td>\${t.status === 'SUCCESS' ? \`<button class="secondary" onclick="dl('\${t.id}','\${t.filename}')">Download</button> \` : ''}\${t.status === 'FAILED' && canRetry() ? \`<button onclick="retryOne('\${t.id}')">Retry</button>\` : ''}</td>
         </tr>\`).join('') || '<tr><td colspan="6">no transfers</td></tr>';
     }
     async function retryOne(id) { await api('/v1/transfers/' + id + '/retry', { method: 'POST' }); load(); }
+    async function dl(id, filename) {
+      const res = await fetch('/v1/transfers/' + id + '/download', { headers: { Authorization: 'Bearer ' + token } });
+      if (!res.ok) return alert('download failed: ' + res.status);
+      const blob = await res.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob); a.download = filename; a.click();
+      URL.revokeObjectURL(a.href);
+    }
     async function retryBatch() {
       if (!canRetry()) return alert('requires operator/admin role');
       const r = await api('/v1/transfers/retry-batch', { method: 'POST', body: JSON.stringify({ status: 'FAILED' }) });

@@ -9,12 +9,16 @@ import configuration, { AppConfig } from './config/configuration';
 import { validateEnv } from './config/env.validation';
 import { AdminUiModule } from './admin-ui/admin-ui.module';
 import { AuthModule } from './auth/auth.module';
+import { CryptoModule } from './crypto/crypto.module';
 import { DatabaseModule } from './database/database.module';
+import { KafkaModule } from './kafka/kafka.module';
 import { HealthModule } from './health/health.module';
 import { IngestionModule } from './ingestion/ingestion.module';
 import { MetricsModule } from './metrics/metrics.module';
 import { NotificationsModule } from './notifications/notifications.module';
+import { QuotaModule } from './quota/quota.module';
 import { StorageModule } from './storage/storage.module';
+import { TenancyModule } from './tenancy/tenancy.module';
 
 @Module({
   imports: [
@@ -83,6 +87,10 @@ import { StorageModule } from './storage/storage.module';
     // Prometheus /metrics + custom transfer metrics (global).
     MetricsModule,
     NotificationsModule,
+    CryptoModule,
+    TenancyModule,
+    QuotaModule,
+    KafkaModule,
     DatabaseModule,
     AuthModule,
     StorageModule,
