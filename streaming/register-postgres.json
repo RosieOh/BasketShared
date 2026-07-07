@@ -1,0 +1,18 @@
+{
+  "name": "syncbridge-postgres",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "syncbridge",
+    "database.password": "REPLACE_PASSWORD",
+    "database.dbname": "syncbridge",
+    "topic.prefix": "syncbridge.cdc",
+    "table.include.list": "public.file_transfers,public.outbox_events,public.tenant_usage",
+    "plugin.name": "pgoutput",
+    "slot.name": "syncbridge_slot",
+    "publication.autocreate.mode": "filtered",
+    "tombstones.on.delete": "false",
+    "snapshot.mode": "initial"
+  }
+}
