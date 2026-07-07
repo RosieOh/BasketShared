@@ -44,6 +44,11 @@ import { MetricsService } from './metrics.service';
       name: 'syncbridge_dead_letter_total',
       help: 'Transfers routed to the dead-letter queue',
     }),
+    makeCounterProvider({
+      name: 'syncbridge_webhook_deliveries_total',
+      help: 'Outbound webhook delivery attempts by outcome',
+      labelNames: ['status'],
+    }),
   ],
   exports: [MetricsService],
 })
