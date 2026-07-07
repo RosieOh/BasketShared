@@ -1,14 +1,12 @@
-import { InjectQueue } from '@nestjs/bullmq';
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { context, propagation } from '@opentelemetry/api';
-import { Queue } from 'bullmq';
 import { createHash } from 'node:crypto';
 import { isAbsolute, relative, resolve } from 'node:path';
 import type { AppConfig } from '../config/configuration';
+import { OutboxService } from '../outbox/outbox.service';
+import { TenantService } from '../tenancy/tenant.service';
 import { SftpgoWebhookDto } from './dto/sftpgo-webhook.dto';
-import { FileTransferRepository } from './file-transfer.repository';
-import { TRANSFER_JOB, TRANSFER_QUEUE, TransferJobData } from './queue/transfer-queue';
 
 /** SFTPGo status code for a successful operation. */
 const SFTPGO_STATUS_OK = 1;
@@ -26,8 +24,8 @@ export class IngestionService {
   private readonly bucket: string;
 
   constructor(
-    private readonly repository: FileTransferRepository,
-    @InjectQueue(TRANSFER_QUEUE) private readonly queue: Queue<TransferJobData>,
+    private readonly outbox: OutboxService,
+    private readonly tenants: TenantService,
     config: ConfigService<AppConfig, true>,
   ) {
     this.dataRoot = resolve(config.get('app.ingestionDataRoot', { infer: true }));
@@ -57,29 +55,34 @@ export class IngestionService {
 
     const idempotencyKey = this.buildIdempotencyKey(payload);
 
-    const record = await this.repository.createPendingIfAbsent({
-      idempotencyKey,
-      filename: this.basename(payload.virtual_path),
-      virtualPath: payload.virtual_path,
-      sourcePath,
-      bucket: this.bucket,
-      sizeBytes: String(payload.file_size ?? 0),
-      username: payload.username,
-      protocol: payload.protocol,
-      sessionId: payload.session_id,
-    });
+    // Capture the trace context now so the eventually-relayed job links back here.
+    const carrier: Record<string, string> = {};
+    propagation.inject(context.active(), carrier);
+
+    // Persist the PENDING row AND the enqueue intent in one transaction; the
+    // outbox relay publishes to the queue after commit (no dual-write window).
+    const record = await this.outbox.createTransferWithOutbox(
+      {
+        idempotencyKey,
+        tenantId: this.tenants.resolve(payload.username),
+        filename: this.basename(payload.virtual_path),
+        virtualPath: payload.virtual_path,
+        sourcePath,
+        bucket: this.bucket,
+        sizeBytes: String(payload.file_size ?? 0),
+        username: payload.username,
+        protocol: payload.protocol,
+        sessionId: payload.session_id,
+      },
+      carrier,
+    );
 
     if (!record) {
       this.logger.log(`Duplicate webhook ignored for ${payload.virtual_path} (key=${idempotencyKey})`);
       return AcceptOutcome.DUPLICATE;
     }
 
-    this.logger.log(`Accepted upload ${payload.virtual_path} -> transfer ${record.id}`);
-    // Propagate the current trace context into the job so the worker span links.
-    const carrier: Record<string, string> = {};
-    propagation.inject(context.active(), carrier);
-    // Enqueue for the worker; the controller returns without awaiting processing.
-    await this.queue.add(TRANSFER_JOB, { transferId: record.id, carrier });
+    this.logger.log(`Accepted upload ${payload.virtual_path} -> transfer ${record.id} (via outbox)`);
     return AcceptOutcome.ACCEPTED;
   }
 

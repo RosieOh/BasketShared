@@ -3,6 +3,8 @@ import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import type { AppConfig } from '../config/configuration';
+import { EventsModule } from '../events/events.module';
+import { OutboxModule } from '../outbox/outbox.module';
 import { DEAD_LETTER_QUEUE, TRANSFER_QUEUE } from './queue/transfer-queue';
 import { DeadLetterProcessor } from './dead-letter.processor';
 import { FileTransfer } from './entities/file-transfer.entity';
@@ -19,6 +21,7 @@ import { AntivirusStep } from './pipeline/antivirus.step';
 import { ContentTypeStep } from './pipeline/content-type.step';
 import { ProcessingPipeline } from './pipeline/processing-pipeline';
 import { PROCESSING_STEPS } from './pipeline/processing-step';
+import { QuotaStep } from './pipeline/quota.step';
 import { ValidationStep } from './pipeline/validation.step';
 
 @Module({
@@ -40,6 +43,8 @@ import { ValidationStep } from './pipeline/validation.step';
       },
     }),
     BullModule.registerQueue({ name: DEAD_LETTER_QUEUE }),
+    OutboxModule,
+    EventsModule,
   ],
   controllers: [IngestionController, TransfersController],
   providers: [
@@ -53,17 +58,19 @@ import { ValidationStep } from './pipeline/validation.step';
     TransfersService,
     // Processing pipeline: steps + ordered assembly.
     ValidationStep,
+    QuotaStep,
     AntivirusStep,
     ContentTypeStep,
     ProcessingPipeline,
     {
       provide: PROCESSING_STEPS,
-      inject: [ValidationStep, AntivirusStep, ContentTypeStep],
-      useFactory: (validation: ValidationStep, antivirus: AntivirusStep, contentType: ContentTypeStep) => [
-        validation,
-        antivirus,
-        contentType,
-      ],
+      inject: [ValidationStep, QuotaStep, AntivirusStep, ContentTypeStep],
+      useFactory: (
+        validation: ValidationStep,
+        quota: QuotaStep,
+        antivirus: AntivirusStep,
+        contentType: ContentTypeStep,
+      ) => [validation, quota, antivirus, contentType],
     },
   ],
 })

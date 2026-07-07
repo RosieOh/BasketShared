@@ -5,13 +5,17 @@ import { context, propagation, SpanStatusCode, trace } from '@opentelemetry/api'
 import { Job, Queue } from 'bullmq';
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
+import { Readable } from 'node:stream';
 import type { AppConfig } from '../config/configuration';
 import { computeFileChecksums } from '../common/checksum.util';
+import { CryptoService } from '../crypto/crypto.service';
 import { NonRetryableError } from '../common/non-retryable.error';
 import { TransferStatus } from './entities/file-transfer.entity';
 import { FileTransferRepository } from './file-transfer.repository';
+import { EventPublisherService } from '../events/event-publisher.service';
 import { MetricsService } from '../metrics/metrics.service';
 import { ProcessingPipeline } from './pipeline/processing-pipeline';
+import { QuotaService } from '../quota/quota.service';
 import { RoutingService } from './routing.service';
 import { StorageService } from '../storage/storage.service';
 import {
@@ -49,6 +53,9 @@ export class IngestionProcessor extends WorkerHost implements OnModuleInit {
     private readonly storage: StorageService,
     private readonly pipeline: ProcessingPipeline,
     private readonly routing: RoutingService,
+    private readonly crypto: CryptoService,
+    private readonly events: EventPublisherService,
+    private readonly quota: QuotaService,
     private readonly metrics: MetricsService,
     @InjectQueue(DEAD_LETTER_QUEUE) private readonly dlq: Queue<DeadLetterJobData>,
     private readonly config: ConfigService<AppConfig, true>,
@@ -119,17 +126,42 @@ export class IngestionProcessor extends WorkerHost implements OnModuleInit {
 
       const checksums = await computeFileChecksums(ctx.sourcePath);
       const target = this.routing.resolve(transfer);
+
+      // Optional client-side envelope encryption: wrap the read stream so the
+      // stored object is ciphertext; persist the wrapped DEK for later decrypt.
+      let body: Readable = createReadStream(ctx.sourcePath);
+      let contentLength = ctx.sizeBytes;
+      let wrappedDek: string | null = null;
+      if (this.crypto.isEnabled) {
+        const enc = this.crypto.createEncryptStream();
+        body = createReadStream(ctx.sourcePath).pipe(enc.stream);
+        contentLength = ctx.sizeBytes + this.crypto.overheadBytes;
+        wrappedDek = enc.wrappedDek;
+      }
+
       const result = await this.storage.uploadStream({
         bucket: target.bucket,
         key: target.key,
-        body: createReadStream(ctx.sourcePath),
-        contentLength: ctx.sizeBytes,
+        body,
+        contentLength,
         contentType: ctx.metadata.contentType ?? 'application/octet-stream',
       });
-      this.verifyIntegrity(result.etag, checksums.md5);
+      // ETag == MD5 only for unencrypted single-part objects; skip when encrypted
+      // (GCM auth tag guarantees ciphertext integrity, sha256 covers the source).
+      if (!wrappedDek) this.verifyIntegrity(result.etag, checksums.md5);
 
-      await this.repository.markSuccess(transfer.id, result.bucket, result.key, result.etag ?? null, checksums.sha256);
+      await this.repository.markSuccess(transfer.id, result.bucket, result.key, result.etag ?? null, checksums.sha256, {
+        encrypted: !!wrappedDek,
+        wrappedDek,
+      });
       this.metrics.recordSuccess(ctx.sizeBytes);
+      await this.quota.recordUsage(transfer.tenantId, ctx.sizeBytes);
+      await this.events.publishTransferEvent(transfer, 'transfer.completed', {
+        bucket: result.bucket,
+        objectKey: result.key,
+        sizeBytes: ctx.sizeBytes,
+        encrypted: !!wrappedDek,
+      });
       this.logger.log(
         `Transfer ${transfer.id} SUCCESS (attempt ${job.attemptsMade + 1}) -> ` +
           `s3://${result.bucket}/${result.key} (type=${ctx.metadata.contentType}, ` +
@@ -141,6 +173,7 @@ export class IngestionProcessor extends WorkerHost implements OnModuleInit {
         this.logger.error(`Transfer ${transfer.id} rejected: ${err.message}`);
         await this.repository.markFailed(transfer.id, err.message);
         this.metrics.recordFailure();
+        await this.events.publishTransferEvent(transfer, 'transfer.failed', { reason: err.message });
         await this.toDeadLetter(transfer.id, err.message);
         return;
       }
@@ -164,6 +197,10 @@ export class IngestionProcessor extends WorkerHost implements OnModuleInit {
     this.logger.error(`Transfer ${job.data.transferId} FAILED. ${message}`);
     await this.repository.markFailed(job.data.transferId, message);
     this.metrics.recordFailure();
+    const transfer = await this.repository.findById(job.data.transferId);
+    if (transfer) {
+      await this.events.publishTransferEvent(transfer, 'transfer.failed', { reason: message });
+    }
     await this.toDeadLetter(job.data.transferId, message);
   }
 
