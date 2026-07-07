@@ -35,11 +35,23 @@ business logic, auditing, and fault tolerance.
 | API docs | **Swagger / OpenAPI** at `/docs` |
 | Observability | pino JSON logs · Prometheus `/metrics` · Grafana dashboard (opt-in) |
 | Tests / CI | Jest unit + **Testcontainers** E2E · GitHub Actions |
+| AuthN / AuthZ | **JWT + RBAC** (admin/operator/viewer) on the management API |
+| Reliable publishing | **Transactional outbox** (no dual-write between DB + queue) |
+| Encryption | **AES-256-GCM envelope** client-side object encryption (optional) |
+| Multi-tenancy | tenant isolation via **PostgreSQL Row-Level Security** |
+| Resilience ops | **Dead-letter queue** + failure alerts (Slack webhook) + Alertmanager |
+| Tracing | **OpenTelemetry** → Jaeger (webhook→worker→S3 in one trace) |
+| Retrieval | **Download API** with on-the-fly decryption, tenant-scoped |
+| Integration | outbound **signed webhooks** + **Kafka** event backbone + **Debezium CDC** |
+| Quotas | per-tenant storage/object **quotas** + usage metering |
+| Admin UI | self-contained dashboard at `/ui` (browse, download, retry) |
+| Orchestration | **Kubernetes** manifests + **KEDA** queue-depth autoscaling (`k8s/`) |
 
 > The worker runs on **BullMQ over Redis**, so the pipeline retries natively,
 > survives restarts, and scales horizontally across orchestrator instances.
 > Two extras are behind Compose **profiles** (off by default):
-> `--profile av` (ClamAV) and `--profile monitoring` (Prometheus + Grafana).
+> `--profile av` (ClamAV) and `--profile monitoring` (Prometheus + Grafana +
+> Alertmanager + Jaeger).
 
 ---
 
@@ -72,11 +84,14 @@ containers always talk to each other on the same address):
 | MinIO API | `http://localhost:${MINIO_API_PORT}` | `minio:9000` | `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` |
 | MinIO console | `http://localhost:${MINIO_CONSOLE_PORT}` | `minio:9001` | `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` |
 | Orchestrator | `http://localhost:${APP_HOST_PORT}` | `nestjs-app:3000` | — |
+| Admin UI | `http://localhost:${APP_HOST_PORT}/ui` | — | login (JWT) |
 | API docs (Swagger) | `http://localhost:${APP_HOST_PORT}/docs` | — | — |
 | Postgres | `localhost:${POSTGRES_HOST_PORT}` (loopback) | `postgres:5432` | `POSTGRES_USER` / `POSTGRES_PASSWORD` |
 | Redis | `localhost:${REDIS_HOST_PORT}` (loopback) | `redis:6379` | — |
 | Grafana (profile: monitoring) | `http://localhost:${GRAFANA_HOST_PORT}` | `grafana:3000` | `GRAFANA_USER` / `GRAFANA_PASSWORD` |
 | Prometheus (profile: monitoring) | `http://localhost:${PROMETHEUS_HOST_PORT}` (loopback) | `prometheus:9090` | — |
+| Alertmanager (profile: monitoring) | `http://localhost:${ALERTMANAGER_HOST_PORT}` (loopback) | `alertmanager:9093` | — |
+| Jaeger (profile: monitoring) | `http://localhost:${JAEGER_UI_HOST_PORT}` | `jaeger:16686` | — |
 
 > **Host-port conflicts.** Only the *published* (host) side is configurable; the
 > internal ports never change. `.env.example` uses canonical ports; the shipped
@@ -198,11 +213,11 @@ equals the object's MD5 (integrity verified).
 
 ### 2.4 Management API (operations)
 
-Guarded by the admin key (`X-Admin-Token: $ADMIN_API_KEY`). Lets operators
+Protected by **JWT + RBAC** (see §2.10 to obtain `$TOKEN`). Lets operators
 inspect history and re-drive failures without touching the database.
 
 ```bash
-H="X-Admin-Token: $ADMIN_API_KEY"
+H="Authorization: Bearer $TOKEN"
 
 # List (newest first); filter + paginate
 curl -s -H "$H" "http://localhost:$APP_HOST_PORT/v1/transfers?status=FAILED&limit=20&offset=0"
@@ -260,11 +275,131 @@ share the queue. The recovery sweeper (`RECOVERY_*`) reconciles any DB rows left
 
 ### 2.9 Testing & CI
 
-- **Unit tests** (`npm test`): ingestion, retry/management, pipeline steps.
+- **Unit tests** (`npm test`): ingestion, retry/management, pipeline steps, routing.
 - **E2E** (`npm run test:e2e`): **Testcontainers** spins up real Postgres, Redis,
-  and MinIO, boots the app, and drives webhook → worker → S3 end to end.
+  and MinIO, boots the app, and drives login → webhook → worker → S3 end to end.
 - **CI** (`.github/workflows/ci.yml`): build + unit + E2E on Node 20, plus a
   Docker image build and a full `docker compose config` validation.
+
+### 2.10 Auth & RBAC
+
+The management API is protected by **JWT** with **role-based access**
+(admin/operator/viewer). A bootstrap admin is seeded on first start from
+`ADMIN_USERNAME`/`ADMIN_PASSWORD`.
+
+```bash
+# Log in, then call the API with the Bearer token.
+TOKEN=$(curl -s -X POST http://localhost:$APP_HOST_PORT/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"'$ADMIN_PASSWORD'"}' | python -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+
+curl -s -H "Authorization: Bearer $TOKEN" "http://localhost:$APP_HOST_PORT/v1/transfers"
+```
+
+Roles: `viewer` reads; `operator`/`admin` can retry. `retry-batch` re-drives many
+at once:
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"status":"FAILED","before":"2026-01-01T00:00:00Z","limit":500}' \
+  "http://localhost:$APP_HOST_PORT/v1/transfers/retry-batch"
+```
+
+### 2.11 Admin dashboard
+
+A self-contained UI is served at `http://localhost:$APP_HOST_PORT/ui` — log in,
+browse transfers, and retry failures (single or batch) from the browser.
+
+### 2.12 Dead-letter queue & alerting
+
+Permanently-failed transfers are pushed to a **dead-letter queue**
+(`file-transfers-dlq`); a processor increments `syncbridge_dead_letter_total` and
+fires a failure alert. Set `ALERTS_ENABLED=true` + `ALERT_WEBHOOK_URL` (Slack
+incoming webhook) to deliver them; otherwise they're logged. With
+`--profile monitoring`, **Alertmanager** also receives Prometheus alert rules
+(`monitoring/alert.rules.yml`).
+
+### 2.13 Distributed tracing
+
+Set `OTEL_ENABLED=true` and run `--profile monitoring` to export OpenTelemetry
+traces to **Jaeger** (`http://localhost:${JAEGER_UI_HOST_PORT}`). HTTP, pg, Redis,
+and S3 calls are auto-instrumented, and the webhook trace is propagated into the
+worker job so one upload is a single end-to-end trace (`transfer.process` span).
+
+### 2.14 Hardening & lifecycle
+
+- **Secrets**: any `<VAR>_FILE` env var is read from that file at boot
+  (Docker/Vault secrets). See `docker-compose.secrets.yml`.
+- **Rate limiting**: per-IP throttling (`THROTTLE_LIMIT`/`THROTTLE_TTL_MS`) +
+  request-body cap (`MAX_PAYLOAD_SIZE_KB`).
+- **Multi-destination routing**: `ROUTING_RULES` (JSON) sends files to different
+  buckets/prefixes by username/extension/path — first match wins.
+- **Retention**: `AUDIT_RETENTION_DAYS` purges old DB rows daily;
+  `S3_LIFECYCLE_DAYS` sets an object-expiry ILM rule on the bucket.
+
+### 2.15 Transactional outbox (reliable publishing)
+
+Accepting a webhook writes the `file_transfers` row **and** an `outbox_events`
+row in one DB transaction; a relay (`OutboxService`) then publishes committed
+events to BullMQ. This eliminates the dual-write window between the DB insert and
+`queue.add` — either both commit or neither does. Publishing is at-least-once and
+the idempotent worker absorbs any duplicate.
+
+### 2.16 Object encryption (envelope, AES-256-GCM)
+
+With `ENCRYPTION_ENABLED=true` (+ `ENCRYPTION_KEK` = base64 32 bytes), each object
+is encrypted client-side before upload: a per-object Data Encryption Key encrypts
+the stream (AES-256-GCM), and the DEK is wrapped with the master key and stored
+(`wrapped_dek`). Stored layout is `[IV || ciphertext || authTag]` (+28 bytes) —
+the same envelope pattern as S3 SSE-KMS, no external KMS required.
+
+### 2.17 Multi-tenancy with PostgreSQL RLS
+
+Transfers carry a `tenant_id` (resolved from the SFTP username via `TENANT_MAP`).
+The management API is tenant-isolated by **Row-Level Security**: tenant users run
+inside a transaction that sets `app.current_tenant`, so the DB policy filters rows
+to their tenant; platform admins bypass. Enforcement is in the database, not just
+the app. **Note:** the app connects as a dedicated **non-superuser** role
+(`APP_DB_USER`, created by `postgres-init/`) because superusers bypass RLS.
+Admins manage tenant users via `POST /v1/users`.
+
+### 2.18 Kubernetes + KEDA autoscaling
+
+`k8s/` holds reference manifests (namespace, config/secret, Postgres/Redis/MinIO,
+a migration Job, the orchestrator, Ingress) plus a **KEDA `ScaledObject`** that
+autoscales the orchestrator on the BullMQ queue depth
+(`bull:file-transfers:wait` in Redis). Deploy with `kubectl apply -k k8s/`. See
+[k8s/README.md](k8s/README.md) (incl. the RWX-storage note for SFTP ingestion).
+
+### 2.19 Download API (with decryption)
+
+`GET /v1/transfers/:id/download` streams the stored object back, **decrypting on
+the fly** (streaming AES-256-GCM) if it was encrypted — tenant-scoped by RLS, so
+users only reach their own objects. The admin UI adds a Download button.
+
+### 2.20 Outbound events (signed webhooks + Kafka)
+
+Terminal transfers emit `transfer.completed` / `transfer.failed`. Tenants
+register subscriptions (`POST /v1/subscriptions`); each event is delivered to
+matching subscribers as a **signed webhook** (`X-SyncBridge-Signature:
+sha256=HMAC`) via a BullMQ delivery queue with retries. The same events are also
+published to a **Kafka** topic (`syncbridge.events`) as an event backbone —
+enable with `KAFKA_ENABLED=true` and `--profile streaming`.
+
+### 2.21 Change Data Capture (Debezium)
+
+With `--profile streaming`, **Debezium** (Kafka Connect) captures Postgres row
+changes on `file_transfers`, `outbox_events`, and `tenant_usage` via logical
+replication and streams them to Kafka topics (`syncbridge.cdc.*`) — a foundation
+for analytics, replication, and audit pipelines. Connector config:
+[streaming/register-postgres.json](streaming/register-postgres.json).
+
+### 2.22 Per-tenant quotas & metering
+
+Storage/object usage is metered per tenant (`tenant_usage`); a pipeline step
+rejects uploads that would exceed the tenant's quota (`TENANT_QUOTAS` /
+`QUOTA_DEFAULT_*`, 0 = unlimited) as a permanent failure. Inspect via
+`GET /v1/usage`.
 
 ---
 
