@@ -131,6 +131,16 @@ export class EnvironmentVariables {
   @IsBoolean()
   AV_ENABLED = false;
 
+  /** Client-side envelope encryption of objects before upload. */
+  @Transform(toBoolean)
+  @IsBoolean()
+  ENCRYPTION_ENABLED = false;
+
+  /** Base64-encoded 32-byte master key (KEK) that wraps per-object data keys. */
+  @IsString()
+  @IsOptional()
+  ENCRYPTION_KEK?: string;
+
   @IsString()
   @IsNotEmpty()
   CLAMAV_HOST = 'clamav';

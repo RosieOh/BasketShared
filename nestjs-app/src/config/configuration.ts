@@ -69,8 +69,27 @@ export interface AppConfig {
     clamavHost: string;
     clamavPort: number;
   };
+  encryption: {
+    enabled: boolean;
+    kek?: string;
+  };
   routing: {
     rules: RoutingRule[];
+  };
+  tenancy: {
+    defaultTenant: string;
+    map: Record<string, string>; // sftp username -> tenant id
+  };
+  quotas: {
+    defaultMaxBytes: number; // 0 = unlimited
+    defaultMaxObjects: number; // 0 = unlimited
+    map: Record<string, { maxBytes?: number; maxObjects?: number }>;
+  };
+  kafka: {
+    enabled: boolean;
+    brokers: string[];
+    clientId: string;
+    eventsTopic: string;
   };
 }
 
@@ -142,7 +161,9 @@ export default (): AppConfig => ({
   database: {
     host: process.env.POSTGRES_HOST as string,
     port: int(process.env.POSTGRES_PORT, 5432),
-    username: process.env.POSTGRES_USER as string,
+    // Connect as the non-superuser app role so RLS applies; fall back to the
+    // admin user (e.g. local dev / e2e without RLS).
+    username: (process.env.APP_DB_USER || process.env.POSTGRES_USER) as string,
     password: process.env.POSTGRES_PASSWORD as string,
     database: process.env.POSTGRES_DB as string,
     synchronize: bool(process.env.DB_SYNCHRONIZE, false),
@@ -164,7 +185,46 @@ export default (): AppConfig => ({
     clamavHost: process.env.CLAMAV_HOST ?? 'clamav',
     clamavPort: int(process.env.CLAMAV_PORT, 3310),
   },
+  encryption: {
+    enabled: bool(process.env.ENCRYPTION_ENABLED, false),
+    kek: process.env.ENCRYPTION_KEK || undefined,
+  },
   routing: {
     rules: parseRoutingRules(process.env.ROUTING_RULES),
   },
+  tenancy: {
+    defaultTenant: process.env.DEFAULT_TENANT ?? 'default',
+    map: parseJsonMap(process.env.TENANT_MAP),
+  },
+  quotas: {
+    defaultMaxBytes: int(process.env.QUOTA_DEFAULT_MAX_BYTES, 0),
+    defaultMaxObjects: int(process.env.QUOTA_DEFAULT_MAX_OBJECTS, 0),
+    map: parseJson(process.env.TENANT_QUOTAS),
+  },
+  kafka: {
+    enabled: bool(process.env.KAFKA_ENABLED, false),
+    brokers: (process.env.KAFKA_BROKERS ?? 'kafka:9092').split(',').map((b) => b.trim()),
+    clientId: process.env.KAFKA_CLIENT_ID ?? 's3-syncbridge',
+    eventsTopic: process.env.KAFKA_EVENTS_TOPIC ?? 'syncbridge.events',
+  },
 });
+
+function parseJson<T>(raw: string | undefined): T {
+  if (!raw) return {} as T;
+  try {
+    const parsed = JSON.parse(raw);
+    return (parsed && typeof parsed === 'object' ? parsed : {}) as T;
+  } catch {
+    return {} as T;
+  }
+}
+
+function parseJsonMap(raw: string | undefined): Record<string, string> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, string>) : {};
+  } catch {
+    return {};
+  }
+}
