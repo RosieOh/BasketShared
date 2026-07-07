@@ -8,8 +8,8 @@ export class InitFileTransfers1719800000000 implements MigrationInterface {
   name = 'InitFileTransfers1719800000000';
 
   public async up(queryRunner: QueryRunner): Promise<void> {
-    await queryRunner.query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`);
-
+    // uuid-ossp is created by the DB init script (needs superuser); see
+    // postgres-init/10-app-role.sh. The app role runs migrations as a non-superuser.
     await queryRunner.query(`
       DO $$ BEGIN
         CREATE TYPE "file_transfers_status_enum" AS ENUM

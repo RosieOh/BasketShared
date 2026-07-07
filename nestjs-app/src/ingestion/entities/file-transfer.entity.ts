@@ -65,6 +65,14 @@ export class FileTransfer {
   @Column({ name: 'checksum_sha256', type: 'varchar', length: 64, nullable: true })
   checksumSha256!: string | null;
 
+  /** True when the stored object is client-side encrypted. */
+  @Column({ name: 'encrypted', type: 'boolean', default: false })
+  encrypted!: boolean;
+
+  /** Base64 wrapped Data Encryption Key (only when encrypted). */
+  @Column({ name: 'wrapped_dek', type: 'text', nullable: true })
+  wrappedDek!: string | null;
+
   @Index('idx_file_transfers_status')
   @Column({ name: 'status', type: 'enum', enum: TransferStatus, default: TransferStatus.PENDING })
   status!: TransferStatus;
@@ -74,6 +82,11 @@ export class FileTransfer {
 
   @Column({ name: 'error_log', type: 'text', nullable: true })
   errorLog!: string | null;
+
+  /** Tenant that owns this transfer (row-level security key). */
+  @Index('idx_file_transfers_tenant')
+  @Column({ name: 'tenant_id', type: 'varchar', length: 100, default: 'default' })
+  tenantId!: string;
 
   // ---- Audit metadata copied from the originating event ----
   @Column({ name: 'username', type: 'varchar', length: 255 })

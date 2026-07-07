@@ -20,6 +20,10 @@ export class User {
   @Column({ name: 'password_hash', type: 'varchar', length: 255 })
   passwordHash!: string;
 
+  /** Tenant this user belongs to; scopes what transfers they can see (RLS). */
+  @Column({ name: 'tenant_id', type: 'varchar', length: 100, default: 'default' })
+  tenantId!: string;
+
   /** Stored as a comma-separated list (TypeORM simple-array). */
   @Column({ type: 'simple-array' })
   roles!: Role[];
