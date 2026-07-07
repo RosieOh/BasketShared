@@ -1,5 +1,6 @@
 import {
   CreateBucketCommand,
+  GetObjectCommand,
   HeadBucketCommand,
   HeadObjectCommand,
   PutObjectCommand,
@@ -116,6 +117,15 @@ export class StorageService {
         throw err;
       }
     }
+  }
+
+  /** Fetch an object as a readable stream plus its stored content type. */
+  async getObject(
+    bucket: string,
+    key: string,
+  ): Promise<{ body: Readable; contentType?: string }> {
+    const res = await this.s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    return { body: res.Body as Readable, contentType: res.ContentType };
   }
 
   /** True when an object already exists — lets the worker skip redundant work. */

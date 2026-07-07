@@ -8,6 +8,7 @@ const PG_UNIQUE_VIOLATION = '23505';
 
 export interface CreatePendingInput {
   idempotencyKey: string;
+  tenantId: string;
   filename: string;
   virtualPath: string;
   sourcePath: string;
@@ -65,6 +66,7 @@ export class FileTransferRepository {
     objectKey: string,
     etag: string | null,
     checksumSha256: string | null,
+    encryption: { encrypted: boolean; wrappedDek: string | null } = { encrypted: false, wrappedDek: null },
   ): Promise<void> {
     await this.repo.update(id, {
       status: TransferStatus.SUCCESS,
@@ -72,6 +74,8 @@ export class FileTransferRepository {
       objectKey,
       etag,
       checksumSha256,
+      encrypted: encryption.encrypted,
+      wrappedDek: encryption.wrappedDek,
       errorLog: null,
     });
   }
