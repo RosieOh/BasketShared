@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: s3-syncbridge
+  labels: { app: orchestrator }
+spec:
+  # Start at 1; KEDA drives the replica count from queue depth.
+  replicas: 1
+  selector:
+    matchLabels: { app: orchestrator }
+  template:
+    metadata:
+      labels: { app: orchestrator }
+    spec:
+      containers:
+        - name: orchestrator
+          image: s3-syncbridge-nestjs-app:latest
+          imagePullPolicy: IfNotPresent
+          # Bypass the image entrypoint's migration step (handled by db-migrate Job).
+          command: ["node", "dist/main.js"]
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - configMapRef: { name: orchestrator-config }
+            - secretRef: { name: orchestrator-secrets }
+          readinessProbe:
+            httpGet: { path: /health/ready, port: 3000 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet: { path: /health/live, port: 3000 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "1", memory: "768Mi" }
+          # NOTE: SFTP ingestion needs the uploaded file readable here. In k8s
+          # that requires an RWX volume shared with SFTPGo (NFS/EFS/CephFS) mounted
+          # at INGESTION_DATA_ROOT, or switching the worker to pull over SFTP.
+      # volumes:
+      #   - name: sftp-data
+      #     persistentVolumeClaim: { claimName: sftpgo-data-rwx }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  namespace: s3-syncbridge
+spec:
+  selector: { app: orchestrator }
+  ports:
+    - port: 3000
+      targetPort: 3000

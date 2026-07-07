@@ -1,0 +1,22 @@
+# Event-driven autoscaling: scale the orchestrator (BullMQ worker) on the depth
+# of the transfer queue's Redis "wait" list. Requires KEDA installed in-cluster
+# (https://keda.sh). BullMQ stores waiting jobs at key `bull:<queue>:wait`.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: orchestrator-scaler
+  namespace: s3-syncbridge
+spec:
+  scaleTargetRef:
+    name: orchestrator
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  pollingInterval: 15   # seconds between queue-length checks
+  cooldownPeriod: 60    # seconds before scaling back down
+  triggers:
+    - type: redis
+      metadata:
+        address: redis.s3-syncbridge.svc.cluster.local:6379
+        listName: "bull:file-transfers:wait"
+        listLength: "20"   # target ~20 queued jobs per replica
+        enableTLS: "false"

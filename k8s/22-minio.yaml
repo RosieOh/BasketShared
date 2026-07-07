@@ -1,0 +1,90 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+  namespace: s3-syncbridge
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: s3-syncbridge
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: minio }
+  strategy: { type: Recreate }
+  template:
+    metadata:
+      labels: { app: minio }
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+          args: ["server", "/data", "--console-address", ":9001"]
+          ports:
+            - { containerPort: 9000, name: api }
+            - { containerPort: 9001, name: console }
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom: { secretKeyRef: { name: orchestrator-secrets, key: S3_ACCESS_KEY_ID } }
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom: { secretKeyRef: { name: orchestrator-secrets, key: S3_SECRET_ACCESS_KEY } }
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet: { path: /minio/health/live, port: api }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: minio-data }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: s3-syncbridge
+spec:
+  selector: { app: minio }
+  ports:
+    - { name: api, port: 9000, targetPort: 9000 }
+    - { name: console, port: 9001, targetPort: 9001 }
+---
+# One-off Job: create the bucket after MinIO is up.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-init
+  namespace: s3-syncbridge
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+          command: ["/bin/sh", "-c"]
+          args:
+            - >
+              until mc alias set local http://minio:9000 "$ACCESS" "$SECRET" >/dev/null 2>&1; do sleep 2; done;
+              mc mb --ignore-existing "local/$BUCKET";
+              mc version enable "local/$BUCKET" || true;
+              echo "bucket ready";
+          env:
+            - name: ACCESS
+              valueFrom: { secretKeyRef: { name: orchestrator-secrets, key: S3_ACCESS_KEY_ID } }
+            - name: SECRET
+              valueFrom: { secretKeyRef: { name: orchestrator-secrets, key: S3_SECRET_ACCESS_KEY } }
+            - name: BUCKET
+              valueFrom: { configMapKeyRef: { name: orchestrator-config, key: S3_BUCKET } }

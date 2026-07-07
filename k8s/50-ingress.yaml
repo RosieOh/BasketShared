@@ -1,0 +1,23 @@
+# Exposes the orchestrator (webhook, management API, /ui, /docs). Adjust host and
+# ingressClassName to your cluster. TLS omitted for brevity — add a tls block +
+# cert-manager annotation in production.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: orchestrator
+  namespace: s3-syncbridge
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: syncbridge.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: orchestrator
+                port:
+                  number: 3000

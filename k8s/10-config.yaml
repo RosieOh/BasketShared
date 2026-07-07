@@ -1,0 +1,63 @@
+# Non-secret runtime config for the orchestrator. Internal service DNS names are
+# used for host values (Kubernetes service discovery).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orchestrator-config
+  namespace: s3-syncbridge
+data:
+  NODE_ENV: "production"
+  APP_PORT: "3000"
+  LOG_LEVEL: "info"
+  LOG_PRETTY: "false"
+  JWT_EXPIRES_IN: "1h"
+  ADMIN_USERNAME: "admin"
+  INGESTION_DATA_ROOT: "/srv/sftpgo/data"
+  WORKER_CONCURRENCY: "5"
+  TRANSFER_MAX_ATTEMPTS: "3"
+  TRANSFER_RETRY_BACKOFF_MS: "1000"
+  THROTTLE_TTL_MS: "60000"
+  THROTTLE_LIMIT: "100"
+  MAX_PAYLOAD_SIZE_KB: "1024"
+  MAX_FILE_SIZE_MB: "1024"
+  AV_ENABLED: "false"
+  ENCRYPTION_ENABLED: "false"
+  ALERTS_ENABLED: "false"
+  RECOVERY_ENABLED: "true"
+  RECOVERY_STALE_MS: "900000"
+  RECOVERY_BATCH_SIZE: "50"
+  AUDIT_RETENTION_DAYS: "0"
+  DEFAULT_TENANT: "default"
+  OTEL_ENABLED: "false"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger-collector:4318"
+  OTEL_SERVICE_NAME: "s3-syncbridge"
+  POSTGRES_HOST: "postgres"
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: "syncbridge"
+  POSTGRES_DB: "syncbridge"
+  DB_SYNCHRONIZE: "false"
+  DB_LOGGING: "false"
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"
+  S3_ENDPOINT: "http://minio:9000"
+  S3_REGION: "us-east-1"
+  S3_BUCKET: "ingested-files"
+  S3_FORCE_PATH_STYLE: "true"
+---
+# Secrets. Replace the placeholder values (or manage via Sealed Secrets / SOPS /
+# External Secrets). The app also supports the `<VAR>_FILE` convention if you
+# prefer mounting secret files instead of env vars.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: orchestrator-secrets
+  namespace: s3-syncbridge
+type: Opaque
+stringData:
+  WEBHOOK_SECRET: "change-me-webhook-secret"
+  JWT_SECRET: "change-me-jwt-signing-secret"
+  ADMIN_PASSWORD: "change-me-admin-password"
+  POSTGRES_PASSWORD: "change-me-postgres-password"
+  S3_ACCESS_KEY_ID: "minioadmin"
+  S3_SECRET_ACCESS_KEY: "change-me-minio-password"
+  # ENCRYPTION_KEK: "<base64 of 32 bytes>"  # required if ENCRYPTION_ENABLED=true

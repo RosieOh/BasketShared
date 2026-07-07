@@ -1,0 +1,20 @@
+# Runs TypeORM migrations once. Orchestrator pods start with migrations bypassed
+# (command override), so schema changes are applied here exactly once per deploy.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate
+  namespace: s3-syncbridge
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: s3-syncbridge-nestjs-app:latest
+          imagePullPolicy: IfNotPresent
+          command: ["node", "./node_modules/typeorm/cli.js", "-d", "dist/database/data-source.js", "migration:run"]
+          envFrom:
+            - configMapRef: { name: orchestrator-config }
+            - secretRef: { name: orchestrator-secrets }
