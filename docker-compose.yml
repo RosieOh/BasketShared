@@ -18,6 +18,16 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    # Logical replication (wal_level=logical) enables Debezium CDC. Harmless when
+    # the streaming profile is off.
+    command:
+      - postgres
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -25,6 +35,8 @@ services:
       TZ: ${TZ}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Runs once on a fresh volume: creates uuid-ossp + the non-superuser app role.
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
     networks: [syncbridge-net]
     # Bound to localhost only — not exposed on the LAN. Host port is decoupled
     # from the internal 5432 so a local Postgres on the host doesn't collide.
@@ -194,15 +206,26 @@ services:
       AV_ENABLED: ${AV_ENABLED}
       CLAMAV_HOST: ${CLAMAV_HOST}
       CLAMAV_PORT: ${CLAMAV_PORT}
+      ENCRYPTION_ENABLED: ${ENCRYPTION_ENABLED}
+      ENCRYPTION_KEK: ${ENCRYPTION_KEK}
       ALERTS_ENABLED: ${ALERTS_ENABLED}
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL}
       ROUTING_RULES: ${ROUTING_RULES}
+      DEFAULT_TENANT: ${DEFAULT_TENANT}
+      TENANT_MAP: ${TENANT_MAP}
+      QUOTA_DEFAULT_MAX_BYTES: ${QUOTA_DEFAULT_MAX_BYTES}
+      QUOTA_DEFAULT_MAX_OBJECTS: ${QUOTA_DEFAULT_MAX_OBJECTS}
+      TENANT_QUOTAS: ${TENANT_QUOTAS}
+      KAFKA_ENABLED: ${KAFKA_ENABLED}
+      KAFKA_BROKERS: ${KAFKA_BROKERS}
+      KAFKA_EVENTS_TOPIC: ${KAFKA_EVENTS_TOPIC}
       OTEL_ENABLED: ${OTEL_ENABLED}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT}
       OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME}
       POSTGRES_HOST: ${POSTGRES_HOST}
       POSTGRES_PORT: ${POSTGRES_PORT}
       POSTGRES_USER: ${POSTGRES_USER}
+      APP_DB_USER: ${APP_DB_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
       DB_SYNCHRONIZE: ${DB_SYNCHRONIZE}
@@ -275,6 +298,10 @@ services:
     image: prom/alertmanager:v0.27.0
     restart: unless-stopped
     profiles: ["monitoring"]
+    # Disable the gossip mesh — single-node, no cluster peers in this stack.
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--cluster.listen-address="
     volumes:
       - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
     networks: [syncbridge-net]
@@ -290,7 +317,8 @@ services:
     networks: [syncbridge-net]
     ports:
       - "${JAEGER_UI_HOST_PORT:-16686}:16686"   # Jaeger UI
-      - "127.0.0.1:4318:4318"                    # OTLP HTTP receiver
+    # OTLP receiver (4318) is reached over the internal network by nestjs-app;
+    # not published to the host to avoid conflicts.
 
   grafana:
     image: grafana/grafana:11.2.0
@@ -309,6 +337,70 @@ services:
     ports:
       - "${GRAFANA_HOST_PORT:-3001}:3000"
 
+  # ---------------------------------------------------------------------------
+  # Kafka event backbone + Debezium CDC (opt-in). Enable with:
+  #   KAFKA_ENABLED=true docker compose --profile streaming up -d
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.8.0
+    restart: unless-stopped
+    profiles: ["streaming"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks: [syncbridge-net]
+    ports:
+      - "127.0.0.1:${KAFKA_HOST_PORT:-19092}:9092"
+
+  # Kafka Connect with the Debezium Postgres connector.
+  connect:
+    image: debezium/connect:2.7.3.Final
+    restart: unless-stopped
+    profiles: ["streaming"]
+    depends_on: [kafka]
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: syncbridge-connect
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+    networks: [syncbridge-net]
+    ports:
+      - "127.0.0.1:${CONNECT_HOST_PORT:-8083}:8083"
+
+  # Registers the Debezium connector once Connect is up.
+  connect-init:
+    image: curlimages/curl:8.10.1
+    profiles: ["streaming"]
+    depends_on: [connect]
+    networks: [syncbridge-net]
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./streaming/register-postgres.json:/config/register-postgres.json:ro
+    entrypoint: >
+      /bin/sh -c '
+      echo "Waiting for Kafka Connect...";
+      until curl -sf http://connect:8083/ >/dev/null; do sleep 3; done;
+      sed "s|REPLACE_PASSWORD|$$POSTGRES_PASSWORD|" /config/register-postgres.json |
+        curl -s -X POST -H "Content-Type: application/json" http://connect:8083/connectors -d @- || true;
+      echo "Debezium connector registered.";
+      '
+
 networks:
   syncbridge-net:
     driver: bridge
@@ -322,3 +414,4 @@ volumes:
   clamav_data:
   prometheus_data:
   grafana_data:
+  kafka_data:
