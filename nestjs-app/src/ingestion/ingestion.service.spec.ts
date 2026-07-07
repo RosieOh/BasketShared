@@ -1,9 +1,8 @@
-import { Queue } from 'bullmq';
 import { FileTransfer } from './entities/file-transfer.entity';
-import { FileTransferRepository } from './file-transfer.repository';
+import { OutboxService } from '../outbox/outbox.service';
+import { TenantService } from '../tenancy/tenant.service';
 import { AcceptOutcome, IngestionService } from './ingestion.service';
 import { SftpgoWebhookDto } from './dto/sftpgo-webhook.dto';
-import { TRANSFER_JOB } from './queue/transfer-queue';
 
 const DATA_ROOT = '/srv/sftpgo/data';
 
@@ -24,48 +23,45 @@ function buildPayload(overrides: Partial<SftpgoWebhookDto> = {}): SftpgoWebhookD
 
 describe('IngestionService', () => {
   let service: IngestionService;
-  let repository: jest.Mocked<Pick<FileTransferRepository, 'createPendingIfAbsent'>>;
-  let queue: jest.Mocked<Pick<Queue, 'add'>>;
+  let outbox: jest.Mocked<Pick<OutboxService, 'createTransferWithOutbox'>>;
 
   beforeEach(() => {
-    repository = { createPendingIfAbsent: jest.fn() };
-    queue = { add: jest.fn() };
+    outbox = { createTransferWithOutbox: jest.fn() };
 
     const config = {
       get: (key: string) =>
         key === 'app.ingestionDataRoot' ? DATA_ROOT : key === 's3.bucket' ? 'test-bucket' : undefined,
     };
 
-    service = new IngestionService(
-      repository as unknown as FileTransferRepository,
-      queue as unknown as Queue,
-      config as never,
-    );
+    const tenants = { resolve: () => 'default' } as unknown as TenantService;
+    service = new IngestionService(outbox as unknown as OutboxService, tenants, config as never);
   });
 
-  it('accepts a valid upload, persists it, and emits the worker event', async () => {
-    repository.createPendingIfAbsent.mockResolvedValue({ id: 'transfer-1' } as FileTransfer);
+  it('accepts a valid upload and persists it atomically via the outbox', async () => {
+    outbox.createTransferWithOutbox.mockResolvedValue({ id: 'transfer-1' } as FileTransfer);
 
     const outcome = await service.accept(buildPayload());
 
     expect(outcome).toBe(AcceptOutcome.ACCEPTED);
-    expect(repository.createPendingIfAbsent).toHaveBeenCalledTimes(1);
-    expect(queue.add).toHaveBeenCalledWith(TRANSFER_JOB, expect.objectContaining({ transferId: 'transfer-1' }));
+    expect(outbox.createTransferWithOutbox).toHaveBeenCalledTimes(1);
+    expect(outbox.createTransferWithOutbox).toHaveBeenCalledWith(
+      expect.objectContaining({ username: 'alice', virtualPath: '/report.csv' }),
+      expect.any(Object),
+    );
   });
 
   it('treats a duplicate webhook (unique-key collision) as a no-op', async () => {
-    repository.createPendingIfAbsent.mockResolvedValue(null);
+    outbox.createTransferWithOutbox.mockResolvedValue(null);
 
     const outcome = await service.accept(buildPayload());
 
     expect(outcome).toBe(AcceptOutcome.DUPLICATE);
-    expect(queue.add).not.toHaveBeenCalled();
   });
 
   it('ignores non-upload actions', async () => {
     const outcome = await service.accept(buildPayload({ action: 'download' }));
     expect(outcome).toBe(AcceptOutcome.IGNORED);
-    expect(repository.createPendingIfAbsent).not.toHaveBeenCalled();
+    expect(outbox.createTransferWithOutbox).not.toHaveBeenCalled();
   });
 
   it('ignores uploads that did not succeed (status != 1)', async () => {
@@ -78,6 +74,6 @@ describe('IngestionService', () => {
       buildPayload({ path: `${DATA_ROOT}/../../etc/passwd` }),
     );
     expect(outcome).toBe(AcceptOutcome.IGNORED);
-    expect(repository.createPendingIfAbsent).not.toHaveBeenCalled();
+    expect(outbox.createTransferWithOutbox).not.toHaveBeenCalled();
   });
 });
