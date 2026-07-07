@@ -9,6 +9,7 @@ export interface JwtPayload {
   sub: string;
   username: string;
   roles: Role[];
+  tenantId: string;
 }
 
 /** Authenticated principal attached to `req.user`. */
@@ -16,6 +17,7 @@ export interface AuthUser {
   userId: string;
   username: string;
   roles: Role[];
+  tenantId: string;
 }
 
 @Injectable()
@@ -29,6 +31,11 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   }
 
   validate(payload: JwtPayload): AuthUser {
-    return { userId: payload.sub, username: payload.username, roles: payload.roles };
+    return {
+      userId: payload.sub,
+      username: payload.username,
+      roles: payload.roles,
+      tenantId: payload.tenantId,
+    };
   }
 }

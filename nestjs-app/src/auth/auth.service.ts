@@ -1,4 +1,10 @@
-import { Injectable, Logger, OnModuleInit, UnauthorizedException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  Logger,
+  OnModuleInit,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -43,18 +49,45 @@ export class AuthService implements OnModuleInit {
     const user = await this.users.findOne({ where: { username } });
     if (!user) return null;
     if (!(await bcrypt.compare(password, user.passwordHash))) return null;
-    return { userId: user.id, username: user.username, roles: user.roles };
+    return { userId: user.id, username: user.username, roles: user.roles, tenantId: user.tenantId };
   }
 
   async login(username: string, password: string): Promise<LoginResult> {
     const user = await this.validateUser(username, password);
     if (!user) throw new UnauthorizedException('Invalid credentials');
-    const token = this.jwt.sign({ sub: user.userId, username: user.username, roles: user.roles });
+    const token = this.jwt.sign({
+      sub: user.userId,
+      username: user.username,
+      roles: user.roles,
+      tenantId: user.tenantId,
+    });
     return {
       access_token: token,
       token_type: 'Bearer',
       expires_in: this.config.get('auth.jwtExpiresIn', { infer: true }),
       roles: user.roles,
     };
+  }
+
+  /** Admin-only: create a user in a given tenant. */
+  async createUser(input: {
+    username: string;
+    password: string;
+    roles: Role[];
+    tenantId?: string;
+  }): Promise<{ id: string; username: string; roles: Role[]; tenantId: string }> {
+    if (await this.users.exist({ where: { username: input.username } })) {
+      throw new ConflictException(`User "${input.username}" already exists`);
+    }
+    const passwordHash = await bcrypt.hash(input.password, BCRYPT_ROUNDS);
+    const user = await this.users.save(
+      this.users.create({
+        username: input.username,
+        passwordHash,
+        roles: input.roles,
+        tenantId: input.tenantId ?? this.config.get('tenancy.defaultTenant', { infer: true }),
+      }),
+    );
+    return { id: user.id, username: user.username, roles: user.roles, tenantId: user.tenantId };
   }
 }
